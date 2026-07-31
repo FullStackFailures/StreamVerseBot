@@ -1,10 +1,27 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║       Telegram Media Indexer Bot  —  Production v6.4      ║
+║       Telegram Media Indexer Bot  —  Production v6.5      ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Monitors admin posts in a Telegram supergroup and        ║
 ║  builds an organised index of media files in a closed     ║
 ║  forum topic (ALL_ADDED_SHOWS).                            ║
+╠══════════════════════════════════════════════════════════╣
+║  v6.5 → Backup-group forward detection (NEW):              ║
+║                                                            ║
+║  • MiddleMan (GROUP_CHAT_ID) remains the single source of  ║
+║    truth exactly as before — nothing about it changed.     ║
+║  • Backup (BACKUP_GROUP_CHAT_ID) is the group members       ║
+║    actually join. The bot NEVER posts movies there on its   ║
+║    own. Instead, the admin manually forwards a MiddleMan    ║
+║    post into Backup.                                        ║
+║  • When the bot sees a FORWARDED message land inside        ║
+║    Backup (from an admin), it automatically creates a NEW   ║
+║    Search-index post inside BACKUP_ALL_ADDED_SHOWS whose    ║
+║    button links to that forwarded message's OWN message id  ║
+║    inside Backup — never back to MiddleMan.                 ║
+║  • This runs as an independent handler (separate PTB        ║
+║    handler group) so the existing MiddleMan admin-indexing   ║
+║    handler (`handle_message`) is completely unaffected.      ║
 ╠══════════════════════════════════════════════════════════╣
 ║  v6.4 → MongoDB Atlas migration:                          ║
 ║                                                            ║
@@ -36,6 +53,23 @@
 ║    ADMIN_IDS         — Comma-separated admin user IDs    ║
 ║    MONGODB_URI       — MongoDB Atlas connection string   ║
 ║    MONGODB_DB_NAME   — MongoDB database name             ║
+║    BACKUP_GROUP_CHAT_ID — Backup supergroup chat ID       ║
+║    BACKUP_ALL_ADDED_SHOWS — Backup group's Search topic id║
+║                                                          ║
+║  Optional — dead MiddleMan mirror groups (up to 8,       ║
+║  numbered 1-8, for disaster recovery if the PRIMARY      ║
+║  MiddleMan itself gets banned):                          ║
+║    MIDDLEMAN_MIRROR_<N>_CHAT_ID          — mirror's chat ║
+║    MIDDLEMAN_MIRROR_<N>_TOPIC_MAP        — same syntax   ║
+║                        as TOPIC_MAP, mirror's OWN topic  ║
+║                        ids (Telegram assigns these       ║
+║                        independently per group)          ║
+║    MIDDLEMAN_MIRROR_<N>_ALL_ADDED_SHOWS  — mirror's OWN  ║
+║                        "Search All Added Shows" topic id ║
+║                        (dedicated field, NOT part of the ║
+║                        TOPIC_MAP string — same pattern   ║
+║                        as ALL_ADDED_SHOWS /              ║
+║                        BACKUP_ALL_ADDED_SHOWS above)     ║
 ║                                                          ║
 ║  Optional .env keys (with defaults):                     ║
 ║    IGNORED_TOPICS    — Comma-separated forum topic IDs   ║
@@ -285,7 +319,20 @@ class Config:
     GROUP_CHAT_ID:     int       = field(default_factory=lambda: _env_int("GROUP_CHAT_ID"))
     ALL_ADDED_SHOWS:   int       = field(default_factory=lambda: _env_int("ALL_ADDED_SHOWS"))
     SEARCH_SHOWS_HERE: int       = field(default_factory=lambda: _env_int("SEARCH_SHOWS_HERE"))
+    BACKUP_GROUP_CHAT_ID: int    = field(default_factory=lambda: _env_int("BACKUP_GROUP_CHAT_ID"))
+    BACKUP_ALL_ADDED_SHOWS: int  = field(default_factory=lambda: _env_int("BACKUP_ALL_ADDED_SHOWS"))
     ADMIN_IDS:         frozenset = field(default_factory=lambda: _env_frozenset("ADMIN_IDS"))
+
+    # ── Optional per-topic remap for the Backup group (v6.7) ───────────
+    # Only needed if the Backup group's topic IDs DON'T line up 1:1 with
+    # the MiddleMan (GROUP_CHAT_ID) topic IDs stored on each movie doc.
+    # Same "Name:id|Name:id" syntax as TOPIC_MAP, keyed by the SAME
+    # topic names used in TOPIC_MAP. If left blank (default), Publish
+    # simply reuses the MiddleMan topic_id as-is inside the Backup
+    # group — zero extra config needed when both groups mirror each
+    # other's topic layout (the current setup).
+    BACKUP_TOPIC_MAP: str = field(default_factory=lambda: _env("BACKUP_TOPIC_MAP", ""))
+
 
     # ── Link delivery / redemption ────────────────────────
     BOT_USERNAME:      str       = field(default_factory=lambda: _env("BOT_USERNAME", ""))
@@ -346,6 +393,228 @@ CFG = Config()
 _TOPIC_MAP = _parse_topic_map(CFG.TOPIC_MAP)
 _TOPIC_LOOKUP = _build_topic_lookup(_TOPIC_MAP)
 
+# ── Backup-group topic remap (v6.7, Publish feature) ────────────────
+# _MIDDLEMAN_ID_TO_NAME:    MiddleMan topic_id -> topic name (reverse of TOPIC_MAP)
+# _BACKUP_TOPIC_MAP:        topic name (raw)        -> Backup-group topic_id
+# _BACKUP_TOPIC_MAP_NORM:   normalized topic name    -> Backup-group topic_id
+#   (normalized the same case/punctuation-insensitive way as TOPIC_MAP's own
+#   lookup, so "MOVIES (HINDI)" in TOPIC_MAP still matches "Movies - Hindi"
+#   typed in BACKUP_TOPIC_MAP instead of silently missing and falling back
+#   to the wrong topic_id.)
+_MIDDLEMAN_ID_TO_NAME: Dict[int, str] = {v: k for k, v in _TOPIC_MAP.items()}
+_BACKUP_TOPIC_MAP = _parse_topic_map(CFG.BACKUP_TOPIC_MAP)
+_BACKUP_TOPIC_MAP_NORM: Dict[str, int] = _build_topic_lookup(_BACKUP_TOPIC_MAP)
+
+
+def _backup_topic_id(middleman_topic_id: Optional[int]) -> Optional[int]:
+    """
+    Resolve which topic a Publish should land in inside the Backup group.
+
+    If BACKUP_TOPIC_MAP is configured, remap by topic NAME (looked up via
+    the MiddleMan TOPIC_MAP, matched case/punctuation-insensitively).
+    Otherwise — the default, zero-config case — simply reuse the same
+    topic_id in the Backup group as-is (only safe when both groups happen
+    to share identical topic ids, which is NOT true for a freshly created
+    replacement group).
+    """
+    if middleman_topic_id is None:
+        return None
+    if _BACKUP_TOPIC_MAP:
+        name = _MIDDLEMAN_ID_TO_NAME.get(middleman_topic_id)
+        norm = _normalize_topic_key(name) if name else ""
+        if norm and norm in _BACKUP_TOPIC_MAP_NORM:
+            return _BACKUP_TOPIC_MAP_NORM[norm]
+        log.warning(
+            f"[BACKUP_TOPIC_MAP] no match for MiddleMan topic_id={middleman_topic_id} "
+            f"(name={name!r}) — falling back to reusing the same topic_id "
+            f"in the Backup group, which is almost certainly WRONG for a "
+            f"freshly created group. Add this topic to BACKUP_TOPIC_MAP."
+        )
+    return middleman_topic_id
+
+
+# ── Dead-clone MiddleMan mirror groups (v6.8, disaster recovery) ────
+#
+#  If the PRIMARY MiddleMan (GROUP_CHAT_ID) itself ever gets banned,
+#  admin needs a second, totally-private, never-shared "dead" clone
+#  group that already contains every post (with a working "🚀 Publish"
+#  button) so publishing to the CURRENT Backup group doesn't depend on
+#  the primary MiddleMan surviving at all.
+#
+#  Configure up to 8 mirrors via numbered env vars (1-indexed, gaps OK):
+#
+#    MIDDLEMAN_MIRROR_1_CHAT_ID=-100xxxxxxxxxx
+#    MIDDLEMAN_MIRROR_1_TOPIC_MAP=OTT SHOWS:11|MOVIES (ENGLISH):13|...
+#    MIDDLEMAN_MIRROR_1_ALL_ADDED_SHOWS=7
+#    MIDDLEMAN_MIRROR_2_CHAT_ID=-100yyyyyyyyyy
+#    MIDDLEMAN_MIRROR_2_TOPIC_MAP=OTT SHOWS:21|MOVIES (ENGLISH):23|...
+#    MIDDLEMAN_MIRROR_2_ALL_ADDED_SHOWS=17
+#
+#  TOPIC_MAP uses the SAME topic names as the primary's own TOPIC_MAP
+#  (Telegram assigns each group's own topic ids independently — they
+#  will NOT match the primary's ids, so this per-mirror map is required
+#  for posts to land in the "same" named topic there).
+#
+#  ALL_ADDED_SHOWS is its OWN dedicated field per mirror (same pattern
+#  as the primary's ALL_ADDED_SHOWS and the Backup group's
+#  BACKUP_ALL_ADDED_SHOWS) — that's where auto-indexed posts (which
+#  have no separate named topic, just the "SEARCH ALL ADDED SHOWS"
+#  index) get mirrored. It is NOT read out of TOPIC_MAP.
+#
+#  Every post made in the primary MiddleMan — /makepost wizard AND
+#  automatically-indexed uploads — is best-effort mirrored (recreated,
+#  never forwarded) into every configured mirror, carrying the EXACT
+#  SAME "🚀 Publish" button (same movie_id, same callback_data) as the
+#  primary copy. Since Publish only ever looks the movie up by its
+#  MongoDB _id — never by which chat/message the button lives in —
+#  pressing Publish from ANY mirror behaves identically to pressing it
+#  on the primary. Mirrors are otherwise inert: no search index, no
+#  cross-post, nothing browses them — they only exist so a working
+#  Publish button survives a primary-MiddleMan ban.
+# ──────────────────────────────────────────────────────────
+def _load_middleman_mirrors() -> List[dict]:
+    mirrors: List[dict] = []
+    for i in range(1, 9):
+        chat_id_raw = _env(f"MIDDLEMAN_MIRROR_{i}_CHAT_ID", "")
+        if not chat_id_raw:
+            continue
+        try:
+            chat_id = int(chat_id_raw)
+        except ValueError:
+            log.warning(f"[MIRROR] MIDDLEMAN_MIRROR_{i}_CHAT_ID={chat_id_raw!r} is not a valid integer — skipping this mirror.")
+            continue
+
+        topic_map_raw = _env(f"MIDDLEMAN_MIRROR_{i}_TOPIC_MAP", "")
+        topic_map = _parse_topic_map(topic_map_raw)
+
+        all_added_shows: Optional[int] = None
+        all_added_raw = _env(f"MIDDLEMAN_MIRROR_{i}_ALL_ADDED_SHOWS", "")
+        if all_added_raw:
+            try:
+                all_added_shows = int(all_added_raw)
+            except ValueError:
+                log.warning(
+                    f"[MIRROR] MIDDLEMAN_MIRROR_{i}_ALL_ADDED_SHOWS={all_added_raw!r} "
+                    f"is not a valid integer — ignoring it for this mirror."
+                )
+
+        mirror = {
+            "index": i,
+            "chat_id": chat_id,
+            "topic_map_norm": _build_topic_lookup(topic_map),
+            "all_added_shows": all_added_shows,
+        }
+
+        # Startup-time validation: catch a missing ALL_ADDED_SHOWS config
+        # immediately (loudly, once) instead of it silently misrouting
+        # every single auto-indexed post to General chat forever.
+        if all_added_shows is None and _normalize_topic_key("ALL_ADDED_SHOWS") not in mirror["topic_map_norm"]:
+            log.warning(
+                f"[MIRROR] MIDDLEMAN_MIRROR_{i}_ALL_ADDED_SHOWS is not set (and "
+                f"TOPIC_MAP has no ALL_ADDED_SHOWS entry either) — auto-indexed "
+                f"posts mirrored into chat_id={chat_id} will land in General "
+                f"chat instead of a proper 'Search All Added Shows' topic. Set "
+                f"MIDDLEMAN_MIRROR_{i}_ALL_ADDED_SHOWS=<topic_id> to fix this."
+            )
+
+        mirrors.append(mirror)
+    return mirrors
+
+
+_MIDDLEMAN_MIRRORS: List[dict] = _load_middleman_mirrors()
+if _MIDDLEMAN_MIRRORS:
+    log.info(f"[MIRROR] {len(_MIDDLEMAN_MIRRORS)} dead MiddleMan mirror group(s) configured: {[m['chat_id'] for m in _MIDDLEMAN_MIRRORS]}")
+
+
+def _resolve_mirror_topic(mirror: dict, topic_name: str) -> Optional[int]:
+    """Resolve the target topic_id for one mirror group.
+
+    "ALL_ADDED_SHOWS" (the logical name used for auto-indexed posts,
+    which have no separate named topic) is resolved via the mirror's
+    OWN dedicated `all_added_shows` field FIRST — that's the correct,
+    intended path, matching how the primary/Backup groups are configured
+    (ALL_ADDED_SHOWS / BACKUP_ALL_ADDED_SHOWS are their own env vars,
+    not entries inside a pipe-separated topic map).
+
+    Named-topic posts are resolved via topic_map_norm as before. If a
+    named topic isn't found there, it falls back to this mirror's
+    ALL_ADDED_SHOWS thread rather than losing the post — and finally to
+    General chat as an absolute last resort. Every fallback is logged
+    so a missing mapping is never silent.
+    """
+    norm = _normalize_topic_key(topic_name) if topic_name else ""
+    all_added_norm = _normalize_topic_key("ALL_ADDED_SHOWS")
+
+    if norm == all_added_norm and mirror.get("all_added_shows") is not None:
+        return mirror["all_added_shows"]
+
+    topic_map_norm = mirror.get("topic_map_norm") or {}
+    if norm and norm in topic_map_norm:
+        return topic_map_norm[norm]
+
+    if mirror.get("all_added_shows") is not None:
+        log.warning(
+            f"[MIRROR] mirror chat_id={mirror['chat_id']} has no topic mapped "
+            f"for {topic_name!r} — using its ALL_ADDED_SHOWS fallback thread."
+        )
+        return mirror["all_added_shows"]
+
+    if all_added_norm in topic_map_norm:
+        log.warning(
+            f"[MIRROR] mirror chat_id={mirror['chat_id']} has no topic mapped "
+            f"for {topic_name!r} — using its ALL_ADDED_SHOWS fallback thread."
+        )
+        return topic_map_norm[all_added_norm]
+
+    log.warning(
+        f"[MIRROR] mirror chat_id={mirror['chat_id']} has NO topic mapping for "
+        f"{topic_name!r} and no ALL_ADDED_SHOWS fallback configured — "
+        f"posting to General chat instead."
+    )
+    return None
+
+
+async def _mirror_post_to_middlemen(
+    bot: Bot,
+    *,
+    poster_file_id: Optional[str],
+    text: str,
+    buttons: List[List[InlineKeyboardButton]],
+    topic_name: str,
+) -> None:
+    """Best-effort: recreate this exact MiddleMan post (poster + text +
+    buttons, INCLUDING the same "🚀 Publish" button) inside every
+    configured dead mirror group. Never raises — a mirror failing must
+    never block or break the primary MiddleMan post."""
+    if not _MIDDLEMAN_MIRRORS:
+        return
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+    for mirror in _MIDDLEMAN_MIRRORS:
+        target_topic_id = _resolve_mirror_topic(mirror, topic_name)
+        try:
+            if poster_file_id:
+                await safe_send(
+                    bot,
+                    method="send_photo",
+                    chat_id=mirror["chat_id"],
+                    message_thread_id=target_topic_id,
+                    photo=poster_file_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await safe_send(
+                    bot,
+                    chat_id=mirror["chat_id"],
+                    message_thread_id=target_topic_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+        except TelegramError as exc:
+            log.warning(f"[MIRROR] failed to mirror post into chat_id={mirror['chat_id']}: {exc}")
+
 # ── Link-delivery globals ───────────────────────────────
 _BOT_USERNAME: str = CFG.BOT_USERNAME.strip()
 _DB_LOCK = threading.Lock()
@@ -371,6 +640,7 @@ class _Stats:
         self.skipped_dupes = 0
         self.welcomes_sent = 0
         self.auto_deleted  = 0
+        self.backup_indexed = 0
 
     def inc(self, key: str, n: int = 1):
         with self._lock:
@@ -385,6 +655,7 @@ class _Stats:
                 "skipped_dupes": self.skipped_dupes,
                 "welcomes_sent": self.welcomes_sent,
                 "auto_deleted":  self.auto_deleted,
+                "backup_indexed": self.backup_indexed,
                 "uptime_sec":    int(time.time() - _START_TIME),
             }
 
@@ -471,7 +742,7 @@ zip_cache  = TTLCache(ttl=CFG.SEEN_TTL_SEC)   # track if zip hint already shown
 # ──────────────────────────────────────────────────────────
 #  LINK STORE (MongoDB / Atlas)
 #
-#  Two collections in the configured database:
+#  Collections in the configured database:
 #    "downloads" → one document per uploaded file
 #      { token, file_id, file_type, file_name, caption,
 #        deep_link, short_url, source_chat_id,
@@ -480,6 +751,9 @@ zip_cache  = TTLCache(ttl=CFG.SEEN_TTL_SEC)   # track if zip hint already shown
 #      { token, label, kind, child_tokens: [...], deep_link,
 #        short_url, source_chat_id, source_message_id,
 #        created_at, downloads_count }
+#    "movies"    → one document per /makepost movie/series post
+#      (see "movies collection" section further below, added in v6.6
+#      for the "🚀 Publish" Backup-deploy feature).
 #
 #  child_tokens is stored as a native Mongo array (no more manual
 #  json.dumps/json.loads round-tripping like the old SQLite store).
@@ -487,11 +761,15 @@ zip_cache  = TTLCache(ttl=CFG.SEEN_TTL_SEC)   # track if zip hint already shown
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
+from bson import ObjectId
+from bson.errors import InvalidId
 
 _mongo_client: MongoClient | None = None
 _mongo_db: Database | None = None
 _downloads_col: Collection | None = None
 _bundles_col: Collection | None = None
+_movies_col: Collection | None = None
+_publish_records_col: Collection | None = None
 
 def _downloads_collection() -> Collection:
     if _downloads_col is None:
@@ -505,12 +783,24 @@ def _bundles_collection() -> Collection:
     return _bundles_col
 
 
+def _movies_collection() -> Collection:
+    if _movies_col is None:
+        raise RuntimeError("MongoDB movies collection is not initialized.")
+    return _movies_col
+
+
+def _publish_records_collection() -> Collection:
+    if _publish_records_col is None:
+        raise RuntimeError("MongoDB publish_records collection is not initialized.")
+    return _publish_records_col
+
+
 def init_link_store() -> None:
     """
     Connect to MongoDB Atlas (CFG.MONGODB_URI / CFG.MONGODB_DB_NAME) and
     ensure the required indexes exist. Called once from on_startup().
     """
-    global _mongo_client, _mongo_db, _downloads_col, _bundles_col
+    global _mongo_client, _mongo_db, _downloads_col, _bundles_col, _movies_col, _publish_records_col
 
     client = MongoClient(CFG.MONGODB_URI, serverSelectionTimeoutMS=10_000)
     client.admin.command("ping")
@@ -518,19 +808,26 @@ def init_link_store() -> None:
     db = client[CFG.MONGODB_DB_NAME]
     downloads_col = db["downloads"]
     bundles_col = db["bundles"]
+    movies_col = db["movies"]
+    publish_records_col = db["publish_records"]
 
     downloads_col.create_index("token", unique=True)
     bundles_col.create_index("token", unique=True)
+    publish_records_col.create_index("movie_id", unique=True)
 
     _mongo_client = client
     _mongo_db = db
     _downloads_col = downloads_col
     _bundles_col = bundles_col
+    _movies_col = movies_col
+    _publish_records_col = publish_records_col
 
     log.info(
         f"[MONGO] Connected — db={CFG.MONGODB_DB_NAME!r} "
         f"(downloads={downloads_col.estimated_document_count()}, "
-        f"bundles={bundles_col.estimated_document_count()})"
+        f"bundles={bundles_col.estimated_document_count()}, "
+        f"movies={movies_col.estimated_document_count()}, "
+        f"publish_records={publish_records_col.estimated_document_count()})"
     )
 
 
@@ -642,6 +939,121 @@ def _increment_bundle_count(token: str) -> None:
     col = _bundles_collection()
     with _DB_LOCK:
         col.update_one({"token": token}, {"$inc": {"downloads_count": 1}})
+
+
+# ──────────────────────────────────────────────────────────
+#  MOVIES COLLECTION  (v6.6 — "🚀 Publish" Backup deploy)
+#
+#  Exactly ONE document per /makepost movie/series post. Captures
+#  everything needed to recreate the EXACT same Telegram post (text,
+#  poster, buttons) inside a Backup group later, without re-uploading
+#  or duplicating any data:
+#
+#    { title, mode, poster_file_id, text, topic_id, topic_name,
+#      buttons: [{label, url}, ...], created_at,
+#      source_chat_id, source_message_id }
+#
+#  Button URLs are the SAME permanent GPLinks/bot deep-links already
+#  used on the MiddleMan post — they are not tied to any message id,
+#  so reposting them verbatim inside Backup works unchanged.
+# ──────────────────────────────────────────────────────────
+def _store_movie(document: dict) -> str:
+    """Insert a new movie document and return its Mongo _id as a string."""
+    col = _movies_collection()
+    with _DB_LOCK:
+        result = col.insert_one(document)
+    return str(result.inserted_id)
+
+
+def _get_movie(movie_id: str) -> Optional[dict]:
+    col = _movies_collection()
+    try:
+        oid = ObjectId(movie_id)
+    except (InvalidId, TypeError):
+        return None
+    with _DB_LOCK:
+        doc = col.find_one({"_id": oid})
+    if doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+
+def _update_movie_source_message(movie_id: str, message_id: int) -> None:
+    """Best-effort: record the MiddleMan message id the movie was posted as."""
+    col = _movies_collection()
+    try:
+        oid = ObjectId(movie_id)
+    except (InvalidId, TypeError):
+        return
+    with _DB_LOCK:
+        col.update_one({"_id": oid}, {"$set": {"source_message_id": message_id}})
+
+
+# ──────────────────────────────────────────────────────────
+#  PUBLISH RECORDS  (v6.7 — "🚀 Publish" MiddleMan → Backup)
+#
+#  ONE lightweight document per movie, upserted on every (re-)publish.
+#  Movie data itself is NEVER duplicated — this only tracks WHERE the
+#  latest Backup copy lives so it can be found/replaced later:
+#
+#    { movie_id, middleman_message_id, public_group_id,
+#      public_topic_id, public_message_id, publish_timestamp }
+# ──────────────────────────────────────────────────────────
+def _store_publish_record(record: dict) -> None:
+    col = _publish_records_collection()
+    document = {
+        "movie_id":              record["movie_id"],
+        "middleman_message_id":  record.get("middleman_message_id"),
+        "public_group_id":       record.get("public_group_id"),
+        "public_topic_id":       record.get("public_topic_id"),
+        "public_message_id":     record.get("public_message_id"),
+        "publish_timestamp":     record.get("publish_timestamp", time.time()),
+    }
+    with _DB_LOCK:
+        col.replace_one({"movie_id": document["movie_id"]}, document, upsert=True)
+
+
+def _get_publish_record(movie_id: str) -> Optional[dict]:
+    col = _publish_records_collection()
+    with _DB_LOCK:
+        return col.find_one({"movie_id": movie_id}, {"_id": 0})
+
+
+def _store_index_movie(
+    *,
+    title: str,
+    text: str,
+    buttons: List[List[InlineKeyboardButton]],
+    topic_id: Optional[int] = None,
+) -> str:
+    """
+    v6.7: persist a lightweight "movie" document for AUTO-indexed posts
+    (the automatic indexing pipeline in `process_batch`) too — not just
+    /makepost wizard posts — so the same admin-only "🚀 Publish" button
+    can recreate them inside the disposable public Backup group later.
+
+    topic_id=None means this post already lives directly inside
+    ALL_ADDED_SHOWS (it IS the search-index post, there's no separate
+    per-topic post to also index) — see `handle_deploy_callback`.
+    """
+    movie_buttons = [
+        {"label": btn.text, "url": btn.url}
+        for row in buttons for btn in row
+        if getattr(btn, "url", None)
+    ]
+    movie_doc = {
+        "title": title,
+        "mode": "auto",
+        "poster_file_id": None,
+        "text": text,
+        "topic_id": topic_id,
+        "topic_name": _topic_name_by_id(topic_id) if topic_id else "",
+        "buttons": movie_buttons,
+        "created_at": time.time(),
+        "source_chat_id": CFG.GROUP_CHAT_ID,
+        "source_message_id": None,
+    }
+    return _store_movie(movie_doc)
 
 
 # ──────────────────────────────────────────────────────────
@@ -1550,6 +1962,19 @@ async def process_batch(tg_app: Application, batch: Batch) -> None:
             f"👇  <i>Download all parts via the button below</i>"
         )
 
+        # v6.7: MiddleMan/Backup separation — store a lightweight movie
+        # doc so this post can be Published to the Backup group later.
+        movie_id = _store_index_movie(title=display_title, text=post_text, buttons=buttons)
+        buttons.append([InlineKeyboardButton("🚀 Publish", callback_data=f"deploy:{movie_id}")])
+
+        # v6.8: best-effort mirror this exact post (same Publish button,
+        # same movie_id) into every dead MiddleMan clone group, so a
+        # primary-MiddleMan ban doesn't lose the ability to Publish.
+        await _mirror_post_to_middlemen(
+            tg_app.bot, poster_file_id=None, text=post_text,
+            buttons=buttons, topic_name="ALL_ADDED_SHOWS",
+        )
+
         sent = await safe_send(
             tg_app.bot,
             chat_id=CFG.GROUP_CHAT_ID,
@@ -1560,6 +1985,7 @@ async def process_batch(tg_app: Application, batch: Batch) -> None:
         )
         if sent:
             stats.inc("indexed")
+            _update_movie_source_message(movie_id, sent.message_id)
             log.info(
                 f"[ZIP-INDEX] {display_title!r} | {part_count} parts | "
                 f"threads={batch.thread_ids}"
@@ -1636,6 +2062,19 @@ async def process_batch(tg_app: Application, batch: Batch) -> None:
     # ── Format and send ────────────────────────────────────────────────
     post_text = _build_post_text(base_title, text_msgs, batch)
 
+    # v6.7: MiddleMan/Backup separation — store a lightweight movie doc
+    # so this post can be Published to the Backup group later.
+    movie_id = _store_index_movie(title=base_title, text=post_text, buttons=buttons)
+    buttons.append([InlineKeyboardButton("🚀 Publish", callback_data=f"deploy:{movie_id}")])
+
+    # v6.8: best-effort mirror this exact post into every dead MiddleMan
+    # clone group — see `_mirror_post_to_middlemen` for why this makes
+    # a primary-MiddleMan ban survivable.
+    await _mirror_post_to_middlemen(
+        tg_app.bot, poster_file_id=None, text=post_text,
+        buttons=buttons, topic_name="ALL_ADDED_SHOWS",
+    )
+
     sent = await safe_send(
         tg_app.bot,
         chat_id=CFG.GROUP_CHAT_ID,
@@ -1646,6 +2085,7 @@ async def process_batch(tg_app: Application, batch: Batch) -> None:
     )
     if sent:
         stats.inc("indexed")
+        _update_movie_source_message(movie_id, sent.message_id)
 
 
 # ──────────────────────────────────────────────────────────
@@ -2345,6 +2785,45 @@ async def _publish_draft_to_group(context: ContextTypes.DEFAULT_TYPE, draft: Pos
 
     text = _wizard_post_text(draft)
 
+    # ── v6.6: store a single "movie" document capturing everything     ──
+    #    needed to recreate this EXACT post inside a Backup group later ──
+    #    via the new "🚀 Publish" button (see handle_deploy_callback ──
+    #    below). Buttons are flattened from the rows built above; their ──
+    #    URLs are the SAME permanent GPLinks/bot deep-links already on   ──
+    #    this post (not tied to any message id), so recreating the post ──
+    #    elsewhere works unchanged, with zero re-uploading and zero      ──
+    #    duplicate MongoDB movie documents (one insert per /makepost).   ──
+    movie_buttons = [
+        {"label": btn.text, "url": btn.url}
+        for row in buttons for btn in row
+        if getattr(btn, "url", None)
+    ]
+    movie_doc = {
+        "title": draft.title,
+        "mode": draft.mode,
+        "poster_file_id": draft.poster_file_id,
+        "text": text,
+        "topic_id": draft.topic_id,
+        "topic_name": draft.topic_name or _topic_name_by_id(draft.topic_id),
+        "buttons": movie_buttons,
+        "created_at": time.time(),
+        "source_chat_id": CFG.GROUP_CHAT_ID,
+        "source_message_id": None,
+    }
+    movie_id = _store_movie(movie_doc)
+    buttons.append([InlineKeyboardButton("🚀 Publish", callback_data=f"deploy:{movie_id}")])
+
+    # v6.8: best-effort mirror this exact post into every dead MiddleMan
+    # clone group — see `_mirror_post_to_middlemen` for why this makes
+    # a primary-MiddleMan ban survivable.
+    await _mirror_post_to_middlemen(
+        context.application.bot,
+        poster_file_id=draft.poster_file_id,
+        text=text,
+        buttons=buttons,
+        topic_name=movie_doc["topic_name"],
+    )
+
     if draft.poster_file_id:
         sent = await safe_send(
             context.application.bot,
@@ -2365,6 +2844,10 @@ async def _publish_draft_to_group(context: ContextTypes.DEFAULT_TYPE, draft: Pos
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode=ParseMode.HTML,
         )
+
+    if sent:
+        _update_movie_source_message(movie_id, sent.message_id)
+
     return sent
 
 
@@ -2758,6 +3241,384 @@ async def cmd_makepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ──────────────────────────────────────────────────────────
+#  "🚀 Publish"  →  DEPLOY TO BACKUP  (v6.6, extended in v6.7)
+#
+#  MiddleMan (GROUP_CHAT_ID) remains the permanent, private archive.
+#  EVERY movie post — both /makepost wizard posts AND automatically
+#  indexed uploads (`process_batch`) — is stored as a single lightweight
+#  MongoDB "movie" document (see the "movies collection" section above)
+#  and gets an admin-only "🚀 Publish" button. Pressing it:
+#
+#    1. Validates the presser is an admin — non-admins get an alert
+#       reading "You are not authorized." (silently ignored nowhere;
+#       Publish always answers the callback either way).
+#    2. Loads the movie document from MongoDB via the id embedded in the
+#       callback_data ("deploy:<mongo_id>") — NOT re-uploaded, NOT
+#       duplicated; this is the exact same document the MiddleMan post
+#       was built from.
+#    3. Recreates the post from scratch (never forwarded/copied — Telegram
+#       strips inline keyboards from forwards) as a brand-new message
+#       inside BACKUP_GROUP_CHAT_ID, in the topic resolved by
+#       `_backup_topic_id()` (identity remap by default; only consults
+#       BACKUP_TOPIC_MAP if that's configured), reusing `safe_send` for
+#       retries/closed-topic handling exactly like every other post in
+#       this bot.
+#    4. For wizard posts that live in their own topic, also creates a
+#       matching Search-index entry inside BACKUP_ALL_ADDED_SHOWS whose
+#       button points at the NEW Backup post — never back to MiddleMan.
+#       Auto-indexed posts already ARE an index post, so this step is
+#       skipped for them (no duplicate index entry).
+#    5. Stores a tiny "publish_records" document (movie_id + where the
+#       Backup copy landed + timestamp) and relabels the button
+#       "✅ Published" on the MiddleMan post — the callback_data is left
+#       untouched, so it can be pressed again any time.
+#
+#  If Backup ever gets banned: create Backup 2, update
+#  BACKUP_GROUP_CHAT_ID / BACKUP_ALL_ADDED_SHOWS (and BACKUP_TOPIC_MAP,
+#  only if topic ids don't line up) in .env, restart, and press
+#  "🚀 Publish" again on each MiddleMan post — no re-upload, no manual
+#  editing, no forwarding, and still only ONE MongoDB movie document
+#  per movie. Any failure is caught, logged, and reported back to the
+#  admin without crashing — just press Publish again to retry.
+# ──────────────────────────────────────────────────────────
+async def _deploy_movie_to_backup(context: ContextTypes.DEFAULT_TYPE, movie: dict) -> Optional[Message]:
+    """Recreate a stored movie document as a brand-new message in Backup.
+
+    If the movie has a real topic_id (a /makepost wizard post that lives
+    in its own named topic), that topic is remapped via `_backup_topic_id`
+    (identity by default). If topic_id is None — an auto-indexed post
+    that already lives directly inside ALL_ADDED_SHOWS — it's recreated
+    directly inside BACKUP_ALL_ADDED_SHOWS instead.
+    """
+    topic_id = movie.get("topic_id")
+    target_topic_id = _backup_topic_id(topic_id) if topic_id else CFG.BACKUP_ALL_ADDED_SHOWS
+    poster_file_id = movie.get("poster_file_id")
+    text = movie.get("text") or f"<b>{html_escape(movie.get('title') or 'Untitled')}</b>"
+
+    keyboard = [
+        [InlineKeyboardButton(b["label"], url=b["url"])]
+        for b in (movie.get("buttons") or [])
+        if b.get("label") and b.get("url")
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    if poster_file_id:
+        return await safe_send(
+            context.application.bot,
+            method="send_photo",
+            chat_id=CFG.BACKUP_GROUP_CHAT_ID,
+            message_thread_id=target_topic_id,
+            photo=poster_file_id,
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+    return await safe_send(
+        context.application.bot,
+        chat_id=CFG.BACKUP_GROUP_CHAT_ID,
+        message_thread_id=target_topic_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _post_backup_search_index(context: ContextTypes.DEFAULT_TYPE, movie: dict, backup_msg: Message) -> Optional[Message]:
+    """Create the matching Search index entry inside BACKUP_ALL_ADDED_SHOWS,
+    pointing at the freshly-created Backup post — never back to MiddleMan."""
+    topic_id = _backup_topic_id(movie.get("topic_id"))
+    if topic_id:
+        link = make_topic_msg_link(CFG.BACKUP_GROUP_CHAT_ID, topic_id, backup_msg.message_id)
+    else:
+        link = make_msg_link(CFG.BACKUP_GROUP_CHAT_ID, backup_msg.message_id)
+
+    title = movie.get("title") or "Untitled"
+    button_label = _button_label(title)
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=link)]])
+    text = movie.get("text") or f"<b>{html_escape(title)}</b>"
+
+    return await safe_send(
+        context.application.bot,
+        chat_id=CFG.BACKUP_GROUP_CHAT_ID,
+        message_thread_id=CFG.BACKUP_ALL_ADDED_SHOWS,
+        text=text,
+        reply_markup=buttons,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _mark_publish_button_done(query, movie_id: str) -> None:
+    """Best-effort: relabel the pressed button '✅ Published' on the
+    MiddleMan post, keeping the SAME callback_data so re-publishing
+    later (e.g. after the Backup group is replaced) still works."""
+    msg = query.message
+    if not msg or not msg.reply_markup:
+        return
+    new_rows = []
+    changed = False
+    for row in msg.reply_markup.inline_keyboard:
+        new_row = []
+        for btn in row:
+            if btn.callback_data == f"deploy:{movie_id}":
+                new_row.append(InlineKeyboardButton("✅ Published", callback_data=btn.callback_data))
+                changed = True
+            else:
+                new_row.append(btn)
+        new_rows.append(new_row)
+    if not changed:
+        return
+    try:
+        await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
+    except TelegramError as exc:
+        log.debug(f"[DEPLOY] could not relabel Publish button: {exc}")
+
+
+async def _publish_movie_core(context: ContextTypes.DEFAULT_TYPE, movie_id: str, movie: dict) -> Tuple[bool, str, Optional[Message]]:
+    """
+    Shared publish logic used by BOTH the per-post "🚀 Publish" button
+    (`handle_deploy_callback`) and the bulk `/republishall` admin command.
+
+    Deploys `movie` into the CURRENT Backup group/topic (reading
+    BACKUP_GROUP_CHAT_ID / BACKUP_ALL_ADDED_SHOWS / BACKUP_TOPIC_MAP fresh
+    from CFG every time — so it always targets whatever Backup group is
+    configured right now), creates the matching Search-index entry when
+    needed, and stores a lightweight publish record.
+
+    Returns (success, status_note, backup_message).
+    """
+    backup_msg = await _deploy_movie_to_backup(context, movie)
+    if not backup_msg:
+        return False, "could not post to the Backup group", None
+
+    # Auto-indexed posts (topic_id is None) already ARE the search-index
+    # post — recreating a second index entry inside BACKUP_ALL_ADDED_SHOWS
+    # would just duplicate it. Only /makepost wizard posts (real topic_id)
+    # need the separate index-post step.
+    index_msg = None
+    if movie.get("topic_id"):
+        index_msg = await _post_backup_search_index(context, movie, backup_msg)
+
+    stats.inc("backup_indexed")
+
+    _store_publish_record({
+        "movie_id": movie_id,
+        "middleman_message_id": movie.get("source_message_id"),
+        "public_group_id": CFG.BACKUP_GROUP_CHAT_ID,
+        "public_topic_id": _backup_topic_id(movie.get("topic_id")) if movie.get("topic_id") else CFG.BACKUP_ALL_ADDED_SHOWS,
+        "public_message_id": backup_msg.message_id,
+        "publish_timestamp": time.time(),
+    })
+
+    if movie.get("topic_id") and not index_msg:
+        return True, "posted, but the Search index entry failed", backup_msg
+    return True, "published", backup_msg
+
+
+async def handle_deploy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("deploy:"):
+        return
+
+    user = update.effective_user
+    if not user or user.id not in CFG.ADMIN_IDS:
+        try:
+            await query.answer("You are not authorized.", show_alert=True)
+        except TelegramError:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except TelegramError as exc:
+        log.debug(f"[DEPLOY] query.answer() failed (likely expired): {exc}")
+
+    chat = update.effective_chat
+    reply_chat_id = chat.id if chat else None
+    movie_id = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+    # Everything below is wrapped so a failure (network blip, Telegram
+    # error, bad topic id, etc.) is logged and reported back to the
+    # admin WITHOUT crashing the bot or the update loop — the admin can
+    # simply press "🚀 Publish" again to retry, nothing is left in a
+    # half-published state since the publish record is only written on
+    # full success.
+    try:
+        movie = _get_movie(movie_id) if movie_id else None
+        if not movie:
+            if reply_chat_id is not None:
+                await context.application.bot.send_message(
+                    chat_id=reply_chat_id, text="❌ Movie not found in database."
+                )
+            return
+
+        success, note, backup_msg = await _publish_movie_core(context, movie_id, movie)
+        if not success or backup_msg is None:
+            if reply_chat_id is not None:
+                await context.application.bot.send_message(
+                    chat_id=reply_chat_id,
+                    text=f"❌ {note.capitalize()}. You can retry by pressing Publish again.",
+                )
+            return
+
+        await _mark_publish_button_done(query, movie_id)
+
+        if reply_chat_id is not None:
+            if note == "published":
+                await context.application.bot.send_message(
+                    chat_id=reply_chat_id,
+                    text=f"✅ Published — {movie.get('title') or 'Untitled'!r}.",
+                )
+            else:
+                await context.application.bot.send_message(
+                    chat_id=reply_chat_id,
+                    text=f"⚠️ {note.capitalize()}. Check BACKUP_ALL_ADDED_SHOWS.",
+                )
+
+        log.info(
+            f"[DEPLOY] movie_id={movie_id} title={movie.get('title')!r} "
+            f"→ backup_message_id={backup_msg.message_id}"
+        )
+    except Exception as exc:  # noqa: BLE001 — never let Publish crash the bot
+        log.exception(f"[DEPLOY] Publish failed for movie_id={movie_id!r}: {exc}")
+        if reply_chat_id is not None:
+            try:
+                await context.application.bot.send_message(
+                    chat_id=reply_chat_id,
+                    text="❌ Publish failed unexpectedly. Check logs and press Publish again to retry.",
+                )
+            except TelegramError:
+                pass
+
+
+# ──────────────────────────────────────────────────────────
+#  "/republishall"  →  BULK PUBLISH  (v6.8, disaster recovery)
+#
+#  For when the Backup group itself gets banned and there are hundreds
+#  of MiddleMan posts to push to the NEW Backup group — clicking
+#  "🚀 Publish" one post at a time isn't practical. This admin-only
+#  command walks EVERY movie document in MongoDB (from the primary
+#  MiddleMan, a mirror, or wherever it's run from — it only reads
+#  MongoDB, never the chat it's called from) and republishes each one
+#  via the exact same `_publish_movie_core` used by the single-post
+#  button, so behaviour is identical:
+#
+#    • Same topic-name-based remap via BACKUP_TOPIC_MAP for wizard
+#      posts (each lands in the SAME named topic in the new Backup
+#      group as it was in MiddleMan — no confusion, no manual mapping).
+#    • Auto-indexed posts go straight to BACKUP_ALL_ADDED_SHOWS.
+#    • Runs as a background task so it never blocks other bot activity
+#      (indexing, /makepost, etc.) while it works through the catalog.
+#    • Only one run at a time (a second /republishall while one is
+#      already running is rejected, not queued or stacked).
+#    • Paced with a short delay between posts, on top of `safe_send`'s
+#      own flood-wait retry handling, to stay well clear of Telegram's
+#      per-chat rate limits.
+#    • Never crashes: any single movie failing is logged and counted,
+#      the run continues, and a final summary (with up to 15 failure
+#      reasons) is posted back when done.
+# ──────────────────────────────────────────────────────────
+_REPUBLISH_LOCK = threading.Lock()
+_REPUBLISH_RUNNING = False
+
+
+async def _run_republish_all(context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int) -> None:
+    global _REPUBLISH_RUNNING
+    bot = context.application.bot
+    try:
+        col = _movies_collection()
+        with _DB_LOCK:
+            docs = list(col.find({}).sort("created_at", 1))
+
+        total = len(docs)
+        if total == 0:
+            await bot.send_message(chat_id=reply_chat_id, text="No movies found in MongoDB — nothing to republish.")
+            return
+
+        await bot.send_message(
+            chat_id=reply_chat_id,
+            text=(
+                f"🚀 Republishing {total} MiddleMan post(s) into the CURRENT "
+                f"Backup group ({CFG.BACKUP_GROUP_CHAT_ID}) — this runs in the "
+                f"background, progress every 25 posts."
+            ),
+        )
+
+        ok = 0
+        failed = 0
+        failures: List[str] = []
+
+        for i, doc in enumerate(docs, start=1):
+            movie_id = str(doc["_id"])
+            doc = dict(doc)
+            doc["_id"] = movie_id
+            title = doc.get("title") or movie_id
+
+            try:
+                success, note, _backup_msg = await _publish_movie_core(context, movie_id, doc)
+                if success:
+                    ok += 1
+                else:
+                    failed += 1
+                    failures.append(f"{title}: {note}")
+            except Exception as exc:  # noqa: BLE001 — one bad movie must not kill the whole run
+                failed += 1
+                failures.append(f"{title}: {exc}")
+                log.exception(f"[REPUBLISH-ALL] unexpected error on movie_id={movie_id}: {exc}")
+
+            if i % 25 == 0 or i == total:
+                try:
+                    await bot.send_message(
+                        chat_id=reply_chat_id,
+                        text=f"⏳ Progress: {i}/{total}  ✅ {ok}  ❌ {failed}",
+                    )
+                except TelegramError:
+                    pass
+
+            # Gentle pacing on top of safe_send's own flood-wait retries.
+            await asyncio.sleep(1.2)
+
+        summary = f"✅ Republish complete — {ok}/{total} succeeded, {failed} failed."
+        if failures:
+            preview = "\n".join(f"• {f}" for f in failures[:15])
+            more = f"\n… and {len(failures) - 15} more (see logs)" if len(failures) > 15 else ""
+            summary += f"\n\nFailures:\n{preview}{more}"
+
+        await bot.send_message(chat_id=reply_chat_id, text=summary[:4000])
+        log.info(f"[REPUBLISH-ALL] done — {ok}/{total} ok, {failed} failed")
+
+    except Exception as exc:  # noqa: BLE001 — the whole run must never crash the bot
+        log.exception(f"[REPUBLISH-ALL] fatal error: {exc}")
+        try:
+            await bot.send_message(chat_id=reply_chat_id, text=f"❌ /republishall crashed: {exc}")
+        except TelegramError:
+            pass
+    finally:
+        with _REPUBLISH_LOCK:
+            _REPUBLISH_RUNNING = False
+
+
+async def cmd_republishall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if user.id not in CFG.ADMIN_IDS:
+        return
+
+    global _REPUBLISH_RUNNING
+    with _REPUBLISH_LOCK:
+        if _REPUBLISH_RUNNING:
+            await msg.reply_text("⏳ A /republishall run is already in progress — please wait for it to finish.")
+            return
+        _REPUBLISH_RUNNING = True
+
+    # Fire-and-forget as a background task so this command returns
+    # immediately and never blocks other bot activity while it runs.
+    asyncio.create_task(_run_republish_all(context, msg.chat.id))
+    await msg.reply_text("🚀 Starting bulk republish — I'll post progress here.")
+
+
+# ──────────────────────────────────────────────────────────
 #  PRIVATE UPLOAD + REDEMPTION HANDLERS
 # ──────────────────────────────────────────────────────────
 async def handle_private_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3046,6 +3907,131 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ──────────────────────────────────────────────────────────
+#  BACKUP GROUP — FORWARDED POST DETECTION  (v6.5, LEGACY)
+#
+#  NOTE (v6.6): this handler is kept registered for backward
+#  compatibility but is SUPERSEDED by the "🚀 Publish" deploy
+#  button above. Forwarding strips inline keyboards, so a forwarded
+#  MiddleMan post never carries its quality/season buttons into
+#  Backup — only its title text. The new deploy flow recreates the
+#  post from MongoDB with buttons intact, which is why it's the
+#  recommended way to populate a Backup group going forward. This
+#  handler is left ACTIVE (not removed) per "do not break anything
+#  that currently works" — if you no longer manually forward posts
+#  into Backup, it will simply never fire.
+#
+#  MiddleMan (CFG.GROUP_CHAT_ID) is the single source of truth. The bot
+#  builds every movie/series/search post there exactly as before — this
+#  section changes NOTHING about that flow.
+#
+#  Backup (CFG.BACKUP_GROUP_CHAT_ID) is the group real members are in.
+#  The bot NEVER posts movies there on its own via THIS handler. When a
+#  forwarded message lands, this handler:
+#
+#    1. Confirms it arrived in Backup AND is a genuine forwarded message
+#       (checked via `forward_origin`, the Bot API 7.0+ field that
+#       replaced the old forward_from/forward_from_chat pair).
+#    2. Extracts the same title text the original MiddleMan post used
+#       (via the existing `extract_text()` helper — works for both plain
+#       text posts and poster-photo posts with an HTML caption).
+#    3. Builds a small Search-index entry using the SAME title-cleaning /
+#       icon / quality-tag helpers the main indexer already uses
+#       (`clean_title_for_display`, `_determine_icon`, `extract_quality_tags`).
+#    4. Posts that entry into BACKUP_ALL_ADDED_SHOWS with a single button
+#       that links to the FORWARDED message's own message_id inside
+#       Backup — built with the existing `make_msg_link` / 
+#       `make_topic_msg_link` helpers — NEVER back to MiddleMan.
+# ──────────────────────────────────────────────────────────
+async def handle_backup_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg  = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    # Only react inside the Backup group.
+    if msg.chat.id != CFG.BACKUP_GROUP_CHAT_ID:
+        return
+
+    # Only the admin manually forwarding archive posts should trigger this.
+    if user.is_bot or user.id not in CFG.ADMIN_IDS:
+        return
+
+    # Must be a genuine forwarded message. `forward_origin` (Bot API 7.0+,
+    # exposed by python-telegram-bot v22) is set on ANY forwarded message
+    # regardless of whether the original sender/channel allows forward
+    # attribution — unlike the older forward_from/forward_from_chat pair,
+    # which could be None for privacy-protected forwards.
+    if not getattr(msg, "forward_origin", None):
+        return
+
+    thread_id = getattr(msg, "message_thread_id", None)
+
+    # Don't create a Search entry for something forwarded directly INTO
+    # the Backup Search topic itself (nothing meaningful to index there).
+    if thread_id == CFG.BACKUP_ALL_ADDED_SHOWS:
+        return
+
+    text = extract_text(msg)
+    if not text or is_filename(text):
+        # Forwarded file with no meaningful title text (e.g. a bare
+        # document forward) — nothing to build a Search entry from.
+        log.debug("[BACKUP-FORWARD] no usable title text — skipping")
+        return
+
+    key = movie_key(text)
+    if not key:
+        return
+
+    # Separate namespace from the MiddleMan seen_cache keys so a title
+    # already indexed in MiddleMan doesn't block its Backup Search entry,
+    # and vice versa.
+    backup_key = f"backup:{key}"
+    if seen_cache.has(backup_key):
+        log.debug(f"[BACKUP-DUPE] {key!r}")
+        stats.inc("skipped_dupes")
+        return
+    seen_cache.set(backup_key)
+
+    display_title, year = clean_title_for_display(text)
+    year_badge   = f"  <code>{year}</code>" if year else ""
+    icon         = _determine_icon(text)
+    quality_tags = extract_quality_tags(text)
+    quality_line = f"\n🎞  <i>{quality_tags}</i>" if quality_tags else ""
+    thread_note  = f"\n📌  <code>Thread #{thread_id}</code>" if thread_id else ""
+
+    post_text = (
+        f"{icon}  <b>{display_title[:200]}</b>{year_badge}"
+        f"{quality_line}"
+        f"{thread_note}\n"
+        f"{_SEP}\n"
+        f"👇  <i>Tap to open the post</i>"
+    )
+
+    # Link points at the FORWARDED message's own id inside Backup — using
+    # the same link builders the main indexer already relies on.
+    if thread_id:
+        link = make_topic_msg_link(msg.chat.id, thread_id, msg.message_id)
+    else:
+        link = make_msg_link(msg.chat.id, msg.message_id)
+
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("📥  Open Post", url=link)]])
+
+    sent = await safe_send(
+        context.application.bot,
+        chat_id=CFG.BACKUP_GROUP_CHAT_ID,
+        message_thread_id=CFG.BACKUP_ALL_ADDED_SHOWS,
+        text=post_text,
+        reply_markup=buttons,
+        parse_mode=ParseMode.HTML,
+    )
+    if sent:
+        stats.inc("backup_indexed")
+        log.info(f"[BACKUP-INDEX] {display_title!r} link={link}")
+    else:
+        log.warning(f"[BACKUP-INDEX] failed to post Search entry for {display_title!r}")
+
+
+# ──────────────────────────────────────────────────────────
 #  ADMIN COMMANDS
 #
 #  Every command below is decorated with @_admin_only which
@@ -3076,7 +4062,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     s = stats.snapshot()
     await msg.reply_text(
-        f"📊  <b>Bot Status — v6.4</b>\n"
+        f"📊  <b>Bot Status — v6.6</b>\n"
         f"{_CMD_SEP}\n"
         f"🎬  Indexed:         <b>{s['indexed']}</b>\n"
         f"📦  ZIP hints:       <b>{s['zip_hints']}</b>\n"
@@ -3086,6 +4072,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"⏳  Pending:         <b>{len(_pending)}</b> batches\n"
         f"👋  Welcomes sent:   <b>{s['welcomes_sent']}</b>\n"
         f"🗑   Auto-deleted:    <b>{s['auto_deleted']}</b> file msgs\n"
+        f"📤  Backup indexed:  <b>{s['backup_indexed']}</b>\n"
         f"⏱   Uptime:          <b>{s['uptime_sec']}s</b>\n"
         f"👥  Admins:          <b>{len(CFG.ADMIN_IDS)}</b>\n"
         f"⚡  Debounce:        <b>{CFG.DEBOUNCE_SEC}s</b>\n"
@@ -3225,7 +4212,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg:
         return
     await msg.reply_text(
-        f"🤖  <b>Media Indexer Bot v6.4  —  Admin Help</b>\n"
+        f"🤖  <b>Media Indexer Bot v6.6  —  Admin Help</b>\n"
         f"{_CMD_SEP}\n"
         f"/status               — Runtime stats\n"
         f"/flush                — Force-process all pending batches now\n"
@@ -3235,7 +4222,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/testdeletemessage    — Preview the file-delivery deletion notice\n"
         f"/help                 — This message\n\n"
         f"{_CMD_SEP}\n"
-        f"🧠  <b>v6.4 Smart Behaviour</b>\n"
+        f"🧠  <b>v6.6 Smart Behaviour</b>\n"
         f"• 1 post per movie — qualities as sorted buttons (4K first)\n"
         f"• .zip.001 / .part01.rar uploads trigger index posts ✅\n"
         f"• <b>Closed topics supported</b> — bot reopens, posts, re-closes\n"
@@ -3258,9 +4245,38 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  redeems via /start or /send now gets auto-deleted after\n"
         f"  <code>{CFG.DELETE_DELAY_SEC}s</code>, with a warning telling them to\n"
         f"  forward it to Saved Messages first — preview with /testdeletemessage\n"
+        f"• <b>NEW — 🚀 Publish</b>: EVERY movie post — /makepost wizard posts\n"
+        f"  AND automatically-indexed uploads — now carries an admin-only\n"
+        f"  <code>🚀 Publish</code> button. Pressing it recreates that EXACT\n"
+        f"  post (same text, poster, and buttons — never forwarded/copied) as\n"
+        f"  a brand-new message inside the Backup group (wizard posts also get\n"
+        f"  a matching Search entry inside BACKUP_ALL_ADDED_SHOWS pointing at\n"
+        f"  the new Backup post — never back to MiddleMan). Nothing is\n"
+        f"  re-uploaded and no duplicate movie document is ever created in\n"
+        f"  MongoDB — only a tiny publish record. The button then relabels to\n"
+        f"  <code>✅ Published</code> (still pressable again any time). If\n"
+        f"  Backup ever gets banned: spin up Backup 2, update\n"
+        f"  BACKUP_GROUP_CHAT_ID / BACKUP_ALL_ADDED_SHOWS (and\n"
+        f"  BACKUP_TOPIC_MAP, only if topic ids differ) in .env, restart, and\n"
+        f"  press <code>🚀 Publish</code> again on each MiddleMan post.\n"
+        f"• <b>NEW — /republishall</b>: bulk-version of Publish. Walks EVERY\n"
+        f"  movie in MongoDB and republishes each one into the CURRENT Backup\n"
+        f"  group/topic — for when Backup gets banned and there are too many\n"
+        f"  posts to Publish one at a time. Runs in the background, posts\n"
+        f"  progress every 25 movies, and a final success/failure summary.\n"
+        f"  Only one run at a time.\n"
+        f"• <b>NEW — Dead MiddleMan mirror groups</b>: if the PRIMARY\n"
+        f"  MiddleMan itself ever gets banned, configure up to 8 private\n"
+        f"  \"dead clone\" groups via <code>MIDDLEMAN_MIRROR_1_CHAT_ID</code> /\n"
+        f"  <code>MIDDLEMAN_MIRROR_1_TOPIC_MAP</code> (and _2_, _3_, …) — every\n"
+        f"  post is best-effort mirrored into all of them with the SAME\n"
+        f"  working <code>🚀 Publish</code> button. If the primary dies, open\n"
+        f"  any mirror and Publish (or /republishall) from there instead —\n"
+        f"  nothing depends on the primary surviving."
+        f"{'  Currently configured: ' + str([m['chat_id'] for m in _MIDDLEMAN_MIRRORS]) if _MIDDLEMAN_MIRRORS else ' Currently NONE configured.'}\n"
         f"• Ignored topics (never indexed): {sorted(CFG.IGNORED_TOPICS) or 'none'}\n"
         f"• All commands are admin-only and hidden from regular users\n"
-        f"• Link/bundle storage now runs on MongoDB Atlas (persistent)\n"
+        f"• Link/bundle/movie storage all run on MongoDB Atlas (persistent)\n"
         f"• Bot token is NEVER revealed in logs",
         parse_mode=ParseMode.HTML,
     )
@@ -3410,10 +4426,12 @@ async def on_startup(tg_app: Application) -> None:
         )
 
     log.info("══════════════════════════════════════════════")
-    log.info("  Media Indexer Bot v6.4  —  starting up")
+    log.info("  Media Indexer Bot v6.6  —  starting up")
     log.info(f"  Group:       {CFG.GROUP_CHAT_ID}")
     log.info(f"  IndexTopic:  {CFG.ALL_ADDED_SHOWS}  (SEARCH ALL ADDED SHOWS — closed topic, auto reopen/close)")
     log.info(f"  ChatTopic:   {CFG.SEARCH_SHOWS_HERE}  (welcome deep-link target)")
+    log.info(f"  BackupGroup: {CFG.BACKUP_GROUP_CHAT_ID}")
+    log.info(f"  BackupIndexTopic: {CFG.BACKUP_ALL_ADDED_SHOWS}")
     log.info(f"  IgnoredTopics: {set(CFG.IGNORED_TOPICS) or '(none)'}")
     log.info(f"  Admins:      {set(CFG.ADMIN_IDS)}")
     log.info(f"  Debounce:    {CFG.DEBOUNCE_SEC}s")
@@ -3421,7 +4439,7 @@ async def on_startup(tg_app: Application) -> None:
     log.info(f"  DeleteDelay: {CFG.DELETE_DELAY_SEC}s")
     log.info(f"  MongoDB:     {CFG.MONGODB_DB_NAME} (connected)")
     log.info("  Token:       ***REDACTED***")
-    log.info("  Mode:        v6.4 (MongoDB Atlas persistent store · poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands)")
+    log.info("  Mode:        v6.9 (MongoDB Atlas persistent store · poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands · backup-group forward auto-index (legacy) · 🚀 Publish backup-deploy for BOTH /makepost and auto-indexed posts)")
     log.info("══════════════════════════════════════════════")
 
     asyncio.create_task(flush_loop(tg_app), name="flush_loop")
@@ -3459,6 +4477,7 @@ def main() -> None:
     application.add_handler(CommandHandler("send", cmd_send))
     application.add_handler(CommandHandler("makepost", cmd_makepost))
     application.add_handler(CallbackQueryHandler(_handle_wizard_callback, pattern=r"^mp:"))
+    application.add_handler(CallbackQueryHandler(handle_deploy_callback, pattern=r"^deploy:"))
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_upload)
     )
@@ -3468,12 +4487,25 @@ def main() -> None:
         MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
     )
 
+    # ── Backup group forward detection (v6.5, legacy — see docstring    ─
+    #    above handle_backup_forward). Registered in its OWN handler     ─
+    #    group (group=1) so it runs INDEPENDENTLY of `handle_message`    ─
+    #    above (group=0). Within a single PTB handler group only the     ─
+    #    first matching handler runs per update; using a separate group  ─
+    #    guarantees both handlers still get a chance to inspect every    ─
+    #    incoming message without interfering with each other.           ─
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, handle_backup_forward),
+        group=1,
+    )
+
     # ── Admin commands (all guarded by @_admin_only) ───────────────────
     application.add_handler(CommandHandler("status",            cmd_status))
     application.add_handler(CommandHandler("flush",             cmd_flush))
     application.add_handler(CommandHandler("clearcache",        cmd_clearcache))
     application.add_handler(CommandHandler("reindex",           cmd_reindex))
     application.add_handler(CommandHandler("testdeletemessage", cmd_testdeletemessage))
+    application.add_handler(CommandHandler("republishall",      cmd_republishall))
     application.add_handler(CommandHandler("help",              cmd_help))
 
     log.info("Bot polling started (drop_pending_updates=True)")

@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 downloads.sqlite3
 downloads.sqlite3.backup
+venv
