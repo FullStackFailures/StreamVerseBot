@@ -35,3 +35,4 @@ DELETE_WARNING_TEMPLATE_HTML = (
     "📢 <b>Join Us On Telegram</b> <a href=\"{group_link}\"><b>{group_name}</b></a>\n"
     "📸 <b>Follow us on Instagram</b> <a href=\"{instagram_link}\"><b>{instagram_label}</b></a>"
 )
+
