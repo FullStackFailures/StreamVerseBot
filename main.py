@@ -581,19 +581,26 @@ async def _mirror_post_to_middlemen(
     text: str,
     buttons: List[List[InlineKeyboardButton]],
     topic_name: str,
-) -> None:
+) -> Dict[int, Message]:
     """Best-effort: recreate this exact MiddleMan post (poster + text +
     buttons, INCLUDING the same "🚀 Publish" button) inside every
     configured dead mirror group. Never raises — a mirror failing must
-    never block or break the primary MiddleMan post."""
+    never block or break the primary MiddleMan post.
+
+    Returns {mirror_chat_id: sent_message} for every mirror the post was
+    successfully sent to, so a caller (e.g. `_mirror_crosspost_stub`) can
+    link BACK to that specific message from a stub post elsewhere in the
+    SAME mirror group.
+    """
+    sent_by_chat: Dict[int, Message] = {}
     if not _MIDDLEMAN_MIRRORS:
-        return
+        return sent_by_chat
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
     for mirror in _MIDDLEMAN_MIRRORS:
         target_topic_id = _resolve_mirror_topic(mirror, topic_name)
         try:
             if poster_file_id:
-                await safe_send(
+                sent = await safe_send(
                     bot,
                     method="send_photo",
                     chat_id=mirror["chat_id"],
@@ -604,7 +611,7 @@ async def _mirror_post_to_middlemen(
                     parse_mode=ParseMode.HTML,
                 )
             else:
-                await safe_send(
+                sent = await safe_send(
                     bot,
                     chat_id=mirror["chat_id"],
                     message_thread_id=target_topic_id,
@@ -612,8 +619,75 @@ async def _mirror_post_to_middlemen(
                     reply_markup=reply_markup,
                     parse_mode=ParseMode.HTML,
                 )
+            if sent:
+                sent_by_chat[mirror["chat_id"]] = sent
         except TelegramError as exc:
             log.warning(f"[MIRROR] failed to mirror post into chat_id={mirror['chat_id']}: {exc}")
+    return sent_by_chat
+
+
+async def _mirror_crosspost_stub(
+    bot: Bot,
+    *,
+    mirror_messages: Dict[int, Message],
+    poster_file_id: Optional[str],
+    text: str,
+    title: str,
+    specific_topic_name: str,
+) -> None:
+    """v6.11: after `_mirror_post_to_middlemen` puts the FULL post (poster +
+    all quality/season buttons + Publish) into a mirror's specific named
+    topic, post a lightweight STUB — poster + a SINGLE "Open Post" button
+    linking back to that exact message inside the SAME mirror group's
+    specific topic — into that mirror's own ALL_ADDED_SHOWS topic instead.
+
+    This mirrors exactly what the primary MiddleMan already does via
+    `_crosspost_to_all_added_shows`: ALL_ADDED_SHOWS is a search index that
+    points AT the real post, never a second copy of every download/Publish
+    button. Only mirrors that actually received the specific-topic post
+    (present in `mirror_messages`) get a stub — never raises, a failure
+    here must never block anything else.
+    """
+    if not _MIDDLEMAN_MIRRORS or not mirror_messages:
+        return
+    button_label = _button_label(title) if title else "Open Post"
+    for mirror in _MIDDLEMAN_MIRRORS:
+        chat_id = mirror["chat_id"]
+        sent_msg = mirror_messages.get(chat_id)
+        if not sent_msg:
+            continue
+
+        specific_topic_id = _resolve_mirror_topic(mirror, specific_topic_name)
+        all_added_topic_id = _resolve_mirror_topic(mirror, "ALL_ADDED_SHOWS")
+        if specific_topic_id:
+            link = make_topic_msg_link(chat_id, specific_topic_id, sent_msg.message_id)
+        else:
+            link = make_msg_link(chat_id, sent_msg.message_id)
+
+        stub_buttons = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=link)]])
+        try:
+            if poster_file_id:
+                await safe_send(
+                    bot,
+                    method="send_photo",
+                    chat_id=chat_id,
+                    message_thread_id=all_added_topic_id,
+                    photo=poster_file_id,
+                    caption=text,
+                    reply_markup=stub_buttons,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await safe_send(
+                    bot,
+                    chat_id=chat_id,
+                    message_thread_id=all_added_topic_id,
+                    text=text,
+                    reply_markup=stub_buttons,
+                    parse_mode=ParseMode.HTML,
+                )
+        except TelegramError as exc:
+            log.warning(f"[MIRROR] failed to post crosspost stub into chat_id={chat_id}: {exc}")
 
 # ── Link-delivery globals ───────────────────────────────
 _BOT_USERNAME: str = CFG.BOT_USERNAME.strip()
@@ -2813,16 +2887,34 @@ async def _publish_draft_to_group(context: ContextTypes.DEFAULT_TYPE, draft: Pos
     movie_id = _store_movie(movie_doc)
     buttons.append([InlineKeyboardButton("🚀 Publish", callback_data=f"deploy:{movie_id}")])
 
-    # v6.8: best-effort mirror this exact post into every dead MiddleMan
-    # clone group — see `_mirror_post_to_middlemen` for why this makes
-    # a primary-MiddleMan ban survivable.
-    await _mirror_post_to_middlemen(
+    # v6.8/v6.11: best-effort mirror this exact post (poster + full
+    # buttons + Publish, unchanged) into every dead MiddleMan clone
+    # group's SPECIFIC topic — see `_mirror_post_to_middlemen` for why
+    # this makes a primary-MiddleMan ban survivable. The mirror's own
+    # ALL_ADDED_SHOWS then gets a lightweight STUB (poster + a single
+    # "Open Post" button pointing back at that specific-topic message
+    # in the SAME mirror) via `_mirror_crosspost_stub` — matching
+    # exactly what the primary MiddleMan gets via
+    # `_crosspost_to_all_added_shows` below (search index, not a
+    # second copy of every download/Publish button). Skipped entirely
+    # when the admin chose ALL_ADDED_SHOWS itself as the topic, same
+    # guard the primary crosspost uses, to avoid posting it twice.
+    mirror_messages = await _mirror_post_to_middlemen(
         context.application.bot,
         poster_file_id=draft.poster_file_id,
         text=text,
         buttons=buttons,
         topic_name=movie_doc["topic_name"],
     )
+    if draft.topic_id is not None and draft.topic_id != CFG.ALL_ADDED_SHOWS:
+        await _mirror_crosspost_stub(
+            context.application.bot,
+            mirror_messages=mirror_messages,
+            poster_file_id=draft.poster_file_id,
+            text=text,
+            title=draft.title,
+            specific_topic_name=movie_doc["topic_name"],
+        )
 
     if draft.poster_file_id:
         sent = await safe_send(
@@ -3336,6 +3428,19 @@ async def _post_backup_search_index(context: ContextTypes.DEFAULT_TYPE, movie: d
     button_label = _button_label(title)
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=link)]])
     text = movie.get("text") or f"<b>{html_escape(title)}</b>"
+    poster_file_id = movie.get("poster_file_id")
+
+    if poster_file_id:
+        return await safe_send(
+            context.application.bot,
+            method="send_photo",
+            chat_id=CFG.BACKUP_GROUP_CHAT_ID,
+            message_thread_id=CFG.BACKUP_ALL_ADDED_SHOWS,
+            photo=poster_file_id,
+            caption=text,
+            reply_markup=buttons,
+            parse_mode=ParseMode.HTML,
+        )
 
     return await safe_send(
         context.application.bot,
@@ -4439,7 +4544,7 @@ async def on_startup(tg_app: Application) -> None:
     log.info(f"  DeleteDelay: {CFG.DELETE_DELAY_SEC}s")
     log.info(f"  MongoDB:     {CFG.MONGODB_DB_NAME} (connected)")
     log.info("  Token:       ***REDACTED***")
-    log.info("  Mode:        v6.9 (MongoDB Atlas persistent store · poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands · backup-group forward auto-index (legacy) · 🚀 Publish backup-deploy for BOTH /makepost and auto-indexed posts)")
+    log.info("  Mode:        v6.11 (MongoDB Atlas persistent store · poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands · backup-group forward auto-index (legacy) · 🚀 Publish backup-deploy for BOTH /makepost and auto-indexed posts)")
     log.info("══════════════════════════════════════════════")
 
     asyncio.create_task(flush_loop(tg_app), name="flush_loop")
@@ -4517,5 +4622,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-    
