@@ -375,6 +375,10 @@ class Config:
     GROUP_NAME: str = field(default_factory=lambda: _env("GROUP_NAME", "StreamVerseOG"))
     GROUP_JOIN_LINK: str = field(default_factory=lambda: _env("GROUP_JOIN_LINK", ""))
 
+    GROUP_NAME_2: str = field(default_factory=lambda: _env("GROUP_NAME_2", "StreamVerseOG Backup"))
+    GROUP_JOIN_LINK_2: str = field(default_factory=lambda: _env("GROUP_JOIN_LINK_2", ""))
+
+
     INSTAGRAM_LABEL: str = field(default_factory=lambda: _env("INSTAGRAM_LABEL", "Instagram"))
     INSTAGRAM_LINK: str = field(default_factory=lambda: _env("INSTAGRAM_LINK", ""))
 
@@ -1387,6 +1391,10 @@ def _build_delivery_notice_text(user) -> str:
         minutes=_delete_delay_minutes_label(),
         group_name=html_escape(CFG.GROUP_NAME.strip() or "our group"),
         group_link=html_escape(CFG.GROUP_JOIN_LINK.strip(), quote=True),
+
+        group_name_2=html_escape(CFG.GROUP_NAME_2.strip() or "our group"),
+        group_link_2=html_escape(CFG.GROUP_JOIN_LINK_2.strip(), quote=True),
+
         instagram_label=html_escape(CFG.INSTAGRAM_LABEL.strip() or "Instagram"),
         instagram_link=html_escape(CFG.INSTAGRAM_LINK.strip(), quote=True),
     )

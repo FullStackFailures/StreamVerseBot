@@ -27,12 +27,15 @@ WELCOME_BUTTON_LABEL = "💬 Go to Chat"
 
 DELETE_WARNING_TEMPLATE_HTML = (
     "👋 Hello <b>{name}</b>,\n\n"
-    "Please Forward this file to your personal chat like saved message or any other group\n\n"
+    "⚠️ Please forward this file to your <b>Saved Messages</b> or any <b>Other Chat</b> to save it.\n\n"
 
-    "<b>Because This File will be Auto Deleted after\n\n</b> "
-    "<b>{minutes} minute(s)</b>.\n\n"
+    "<b>This file will be automatically deleted in</b>\n"
+    "<b>{minutes} minute(s).</b>\n\n"
 
-    "📢 <b>Join Us On Telegram</b> <a href=\"{group_link}\"><b>{group_name}</b></a>\n"
+    "📢 <b>MAIN CHANNEL</b> <a href=\"{group_link}\"><b>{group_name}</b></a>\n"
+    "📢 <b>BACKUP CHANNEL</b> <a href=\"{group_link_2}\"><b>{group_name_2}</b></a>\n\n"
+
     "📸 <b>Follow us on Instagram</b> <a href=\"{instagram_link}\"><b>{instagram_label}</b></a>"
+    
 )
 
